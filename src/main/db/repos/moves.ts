@@ -6,14 +6,16 @@ import {
   DECK_PROXIED,
   DECK_TRAITS_JOIN,
   DECK_TREATMENT,
+  applyFill,
   applyOneMove,
   pruneEmptyEntries,
   recordMove,
   setEntryTraits
 } from './decks.js'
 import { addToCollection } from './collection.js'
+import { possessionOfLabel } from './decks.js'
 import { t } from '@shared/i18n/index'
-import { getLocale } from './settings.js'
+import { getLabelPossession, getLocale } from './settings.js'
 import type { Condition, Finish, TranslationKey } from '@shared/types'
 
 /** Localised message, resolved at throw time from the stored locale. */
@@ -203,11 +205,26 @@ export function moveToCollection(
  * the row is created if the decklist has never mentioned it. The printing that goes
  * in is *yours* — moving a Japanese copy into a deck that lists the English one
  * records your printing, which DECK_PRINTING then resolves everywhere.
+ *
+ * With `fillEntryScryfallId` it does the other thing, and the difference is the deck's
+ * size. See that parameter.
  */
 export function moveToDeck(
   deckId: number,
   itemId: number,
-  quantity: number
+  quantity: number,
+  /**
+   * The listed entry these copies are filling, when they are filling one.
+   *
+   * The *resolved* printing, for the reason `moveToCollection`'s fourth parameter gives:
+   * that is the id the deck screen renders and so the only one it can hand back.
+   *
+   * Left off, this is an ordinary move in — the deck gains copies the decklist never asked
+   * for and grows by that many. Passed, the deck does not grow: the slot the list was
+   * already counting is what gets filled, so the copies arrive without the total moving.
+   * Which is why it is a separate question rather than a flag on the same one.
+   */
+  fillEntryScryfallId?: string | null
 ): { moved: number } {
   if (quantity <= 0) throw new Error(tr('err.quantityAtLeastOne'))
   return transaction((db) => {
@@ -252,6 +269,50 @@ export function moveToDeck(
     }
 
     /*
+      Which listed slots these copies could fill, when they are filling any.
+
+      Read before anything is written, so a refusal costs nothing. Unheld and unproxied
+      only: a held slot's copies are already there and a proxied one is filled by the
+      stand-in, which is the same question `in_deck` asks.
+    */
+    const slots = fillEntryScryfallId
+      ? (db.all(
+          `SELECT dc.id, dc.quantity, dc.scryfall_id AS entry_scryfall_id,
+                  dc.finish AS entry_finish
+             FROM deck_cards dc
+             ${DECK_OVERRIDE_JOIN}
+             ${DECK_TRAITS_JOIN}
+            WHERE dc.deck_id = ? AND dc.oracle_id = ? AND dc.quantity > 0
+              AND dc.label_possession IS NOT 'owned'
+              AND ${DECK_PROXIED} = 0
+            ORDER BY COALESCE(${DECK_PRINTING} = ?, 0) DESC, dc.id`,
+          [deckId, row.oracle_id, fillEntryScryfallId]
+        ) as {
+          id: number
+          quantity: number
+          entry_scryfall_id: string
+          entry_finish: string
+        }[])
+      : []
+
+    if (fillEntryScryfallId) {
+      const room = slots.reduce((sum, slot) => sum + slot.quantity, 0)
+      if (room < quantity) {
+        throw new Error(tr('err.fillShortfall', { room, asked: quantity }))
+      }
+      /*
+        A proxy cannot fill a listed slot.
+
+        Not because it would mislabel anything — because the app already has the right
+        answer for "this slot is filled by a stand-in", which is to mark the slot itself a
+        proxy. That costs no collection row and `in_deck` already honours it. Consuming a
+        printed copy to say the same thing would spend an inventory row on a fact the deck
+        can hold by itself.
+      */
+      if (row.proxied === 1) throw new Error(tr('err.fillProxy'))
+    }
+
+    /*
       A proxy has to stay worth nothing.
 
       `row.proxied` was read and then ignored, so moving a printed copy into a deck
@@ -293,6 +354,12 @@ export function moveToDeck(
       ])
     }
 
+    /*
+      The entry a fill is against, named on the ledger row so a replay and a revert can
+      both find it again. The first slot is the one the screen asked for whenever it still
+      exists; `applyFill` walks the rest in the same order if it does not stretch.
+    */
+    const target = slots[0]
     recordMove(db, {
       deckId,
       oracleId: row.oracle_id,
@@ -300,14 +367,28 @@ export function moveToDeck(
       finish: row.finish,
       condition: row.condition,
       quantity,
-      foilTreatment: row.foil_treatment
+      foilTreatment: row.foil_treatment,
+      entryScryfallId: target?.entry_scryfall_id ?? null,
+      entryFinish: target?.entry_finish ?? null,
+      fills: !!fillEntryScryfallId
     })
-    applyOneMove(db, deckId, {
-      oracle_id: row.oracle_id,
-      scryfall_id: row.scryfall_id,
-      finish: row.finish,
-      quantity
-    })
+    if (fillEntryScryfallId) {
+      applyFill(db, deckId, {
+        oracle_id: row.oracle_id,
+        scryfall_id: row.scryfall_id,
+        finish: row.finish,
+        quantity,
+        entry_scryfall_id: target?.entry_scryfall_id ?? null,
+        entry_finish: target?.entry_finish ?? null
+      })
+    } else {
+      applyOneMove(db, deckId, {
+        oracle_id: row.oracle_id,
+        scryfall_id: row.scryfall_id,
+        finish: row.finish,
+        quantity
+      })
+    }
 
     /*
       Carry the two facts `deck_cards` cannot hold itself.
@@ -345,9 +426,12 @@ export function revertMove(moveId: number): { deckId: number; quantity: number }
  * claiming a card that does not exist.
  */
 export function revertMoveIn(db: Sql, moveId: number): { deckId: number; quantity: number } {
+  // `entry_scryfall_id` for the same reason `applyDeckMoves` selects it: it names the
+  // entry the copies belong to when that is not their own printing, and dropping it here
+  // made the undo prefer the wrong row on any deck with a printing override.
   const move = db.get(
-    `SELECT id, deck_id, oracle_id, scryfall_id, finish, condition, quantity,
-            foil_treatment
+    `SELECT id, deck_id, oracle_id, scryfall_id, entry_scryfall_id, entry_finish, finish,
+            condition, quantity, foil_treatment, fills
      FROM deck_card_moves WHERE id = ?`,
     [moveId]
   ) as
@@ -356,13 +440,113 @@ export function revertMoveIn(db: Sql, moveId: number): { deckId: number; quantit
         deck_id: number
         oracle_id: string
         scryfall_id: string
+        entry_scryfall_id: string | null
+        entry_finish: string | null
         finish: string
         condition: string
         quantity: number
         foil_treatment: string | null
+        fills: number
       }
     | undefined
   if (!move) throw new Error(tr('err.moveNotFound'))
+
+  /*
+    Undoing a fill is not `applyOneMove` with the sign flipped.
+
+    A fill did not add copies to the deck, so taking copies away is not its inverse. What
+    it did was repoint a listed slot onto your printing; putting that back means giving the
+    slot its own printing and finish again -- which is why the ledger carries both -- and
+    merging the remainder row back in when the fill had split one off, so the deck ends up
+    with the single row it started with.
+  */
+  if (move.fills === 1) {
+    const filled = db.all(
+      `SELECT id, quantity, label FROM deck_cards
+        WHERE deck_id = ? AND oracle_id = ? AND scryfall_id = ?
+          AND label_possession = 'owned'
+        ORDER BY id`,
+      [move.deck_id, move.oracle_id, move.scryfall_id]
+    ) as { id: number; quantity: number; label: string | null }[]
+    /*
+      Scoped to the printing the copies went in on, and to rows that are actually held.
+      The move-out branch below sums the whole oracle, which here would happily find four
+      copies in rows the fill never touched and mint the difference.
+    */
+    const held = filled.reduce((sum, r) => sum + r.quantity, 0)
+    if (held < move.quantity) {
+      throw new Error(tr('err.moveGone', { count: held, needed: move.quantity }))
+    }
+
+    const entryPrinting = move.entry_scryfall_id ?? move.scryfall_id
+    const entryFinish = move.entry_finish ?? move.finish
+    let owed = move.quantity
+    for (const rowBack of filled) {
+      if (owed <= 0) break
+      const give = Math.min(owed, rowBack.quantity)
+      owed -= give
+      /*
+        The remainder this fill split off, if it did. Merging into it keeps the promise the
+        split made -- that the two halves come back together -- rather than leaving a deck
+        holding two rows of one printing for a slot the decklist writes once.
+      */
+      const remainder = db.get(
+        `SELECT id, quantity, label_possession FROM deck_cards
+          WHERE deck_id = ? AND oracle_id = ? AND scryfall_id = ? AND id != ?
+          ORDER BY id LIMIT 1`,
+        [move.deck_id, move.oracle_id, entryPrinting, rowBack.id]
+      ) as { id: number; quantity: number; label_possession: string | null } | undefined
+
+      if (give === rowBack.quantity && remainder) {
+        db.run('UPDATE deck_cards SET quantity = ? WHERE id = ?', [
+          remainder.quantity + give,
+          remainder.id
+        ])
+        db.run('DELETE FROM deck_cards WHERE id = ?', [rowBack.id])
+      } else if (give === rowBack.quantity) {
+        /*
+          Nothing to merge into: the slot was filled whole. The row becomes the listed
+          entry again, and its possession goes back to what its label says -- not to NULL,
+          which is a different answer and would leave the badge blank until the next sync.
+        */
+        db.run(
+          `UPDATE deck_cards
+              SET scryfall_id = ?, finish = ?, label_possession = ?
+            WHERE id = ?`,
+          [entryPrinting, entryFinish, possessionOfLabel(rowBack.label, getLabelPossession()), rowBack.id]
+        )
+      } else {
+        // Part of it goes back; the rest stays filled.
+        db.run('UPDATE deck_cards SET quantity = ? WHERE id = ?', [
+          rowBack.quantity - give,
+          rowBack.id
+        ])
+        if (remainder) {
+          db.run('UPDATE deck_cards SET quantity = ? WHERE id = ?', [
+            remainder.quantity + give,
+            remainder.id
+          ])
+        }
+      }
+    }
+
+    // And the copies come back, treatment included, exactly as the other direction does.
+    const back = addToCollection({
+      scryfall_id: move.scryfall_id,
+      finish: move.finish as Finish,
+      condition: move.condition as Condition,
+      quantity: move.quantity
+    })
+    if (move.foil_treatment !== null) {
+      db.run('UPDATE collection_items SET foil_treatment = ? WHERE id = ?', [
+        move.foil_treatment,
+        back
+      ])
+    }
+
+    db.run('DELETE FROM deck_card_moves WHERE id = ?', [moveId])
+    return { deckId: move.deck_id, quantity: move.quantity }
+  }
 
   if (move.quantity < 0) {
     // It went deck -> collection, so put it back: take the copies out of the

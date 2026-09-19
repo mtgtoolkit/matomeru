@@ -262,8 +262,26 @@ const api = {
         quantity,
         scryfallId ?? null
       ),
-    moveToDeck: (deckId: number, itemId: number, quantity: number) =>
-      call<{ moved: number }>('decks:moveToDeck', deckId, itemId, quantity),
+    /**
+     * Puts copies from the collection into a deck.
+     *
+     * `fillEntryScryfallId` names a listed entry these copies are filling — the printing
+     * the deck screen renders. Left off, the deck simply gains copies and grows by that
+     * many; passed, it fills what the decklist already asked for and its total is unchanged.
+     */
+    moveToDeck: (
+      deckId: number,
+      itemId: number,
+      quantity: number,
+      fillEntryScryfallId?: string | null
+    ) =>
+      call<{ moved: number }>(
+        'decks:moveToDeck',
+        deckId,
+        itemId,
+        quantity,
+        fillEntryScryfallId ?? null
+      ),
     revertMove: (moveId: number) =>
       call<{ deckId: number; quantity: number }>('decks:revertMove', moveId),
     /** Records which printing you own, for the cards you selected and no others. */

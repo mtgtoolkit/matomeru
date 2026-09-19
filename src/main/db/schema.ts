@@ -936,5 +936,33 @@ export const MIGRATIONS: Migration[] = [
       -- belongs.
       INSERT OR REPLACE INTO settings (key, value) VALUES ('prices.fillEnglish', 'pending');
     `
+  },
+  {
+    version: 22,
+    name: 'fills',
+    sql: `
+      -- A move that fills a slot the decklist already counted, rather than adding to the
+      -- deck.
+      --
+      -- The difference is the deck's size. Moving a card in gives the deck a copy the
+      -- decklist never asked for, so it grows by one. Filling means the copies the list was
+      -- already counting have arrived: the listed row is repointed onto the printing you
+      -- actually put there and the total does not move. Everything that counts cards keeps
+      -- reading label_possession, because a filled row is wholly held and an unfilled
+      -- remainder wholly is not -- the split is what keeps that true.
+      --
+      -- Its own flag rather than inferring one from "a positive move that also names an
+      -- entry". That shape is unused today only by accident, and inferring from it would
+      -- make any future caller that passes an entry id silently create a fill. A column
+      -- says what was meant.
+      ALTER TABLE deck_card_moves ADD COLUMN fills INTEGER NOT NULL DEFAULT 0;
+
+      -- The finish the entry carried, which a revert puts back.
+      --
+      -- scryfall_id and finish stay the *copies'* -- a revert looks the collection row up
+      -- by them -- so the entry's own have to be recorded separately, exactly as
+      -- entry_scryfall_id already records its printing for a move out.
+      ALTER TABLE deck_card_moves ADD COLUMN entry_finish TEXT;
+    `
   }
 ]

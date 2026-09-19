@@ -190,7 +190,14 @@ export function moveScopes(deckId: number | null): UndoScope[] {
       table for the reason the others are -- the rows a move touches are not knowable
       from a deck id, and the table holds a handful of rows.
     */
-    wholeTable('deck_entry_traits')
+    wholeTable('deck_entry_traits'),
+    /*
+      A fill can repoint the printing a deck entry names, and undo has to be able to put
+      that back. Scoped per deck like `deck_cards`, since an override names one.
+    */
+    deckId === null
+      ? wholeTable('deck_card_overrides')
+      : { table: 'deck_card_overrides', where: 'deck_id = ?', params: [deckId] }
   )
 }
 

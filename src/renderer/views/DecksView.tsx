@@ -10,6 +10,7 @@ import {
   Layers,
   Link2,
   Lock,
+  PackagePlus,
   RefreshCw,
   RotateCcw,
   Rows3,
@@ -44,6 +45,7 @@ import { useCardPreview } from '../components/CardHoverPreview'
 import CardZoom from '../components/CardZoom'
 import Paginator from '../components/Paginator'
 import AddToListDialog from '../components/AddToListDialog'
+import FillSlotDialog from '../components/FillSlotDialog'
 import FoilBadge from '../components/FoilBadge'
 import Popover from '../components/Popover'
 import { FINISH_LABEL } from '../lib/format'
@@ -542,6 +544,7 @@ function DeckDetail({
 
   /** Open while the dialog is asking which list and what happens to the copies. */
   const [listDialog, setListDialog] = useState(false)
+
   /*
     The closer look, opened from a row's thumbnail.
 
@@ -616,6 +619,46 @@ function DeckDetail({
     `breakdown.cards` is the distinct list, built once in the main process.
   */
   const allDeckCards = breakdown.cards
+  /*
+    The entry whose slot is being filled, held by id rather than as a row.
+
+    A background sync or this screen's own `invalidate` can rebuild the breakdown while
+    the dialog is open, so a snapshot would go stale — its slot count with it. Deriving
+    the row from the id each render is the same rule the selection prune follows: what is
+    gone is dropped, and the dialog closes itself when its entry disappears.
+  */
+  const [fillId, setFillId] = useState<number | null>(null)
+  const fillCard = fillId === null ? null : allDeckCards.find((c) => c.id === fillId) ?? null
+  const openFill = useCallback((id: number) => setFillId(id), [])
+  /*
+    A stable callback, like `openFill` beside it.
+
+    This was an inline arrow, which defeated `DeckCardLine`'s memo on every render of this
+    component -- so every filter keystroke re-rendered every visible row. Fixed here rather
+    than left alone, because adding a second callback next to it would otherwise look like
+    the cause of a stutter that predates it.
+  */
+  const openZoom = useCallback(
+    (scryfallId: string, title: string, hasBack: boolean) =>
+      setZoom({ scryfallId, title, hasBack }),
+    []
+  )
+
+  /**
+   * Puts copies of yours into a slot the decklist is still asking for.
+   *
+   * The fourth argument is what makes this a fill rather than an ordinary move in: the
+   * deck does not grow, the slot it already counted is filled. See `moveToDeck`.
+   */
+  const fillSlot = async (card: DeckCardRow, itemId: number, quantity: number): Promise<void> => {
+    const result = await guard(() =>
+      window.api.decks.moveToDeck(deck.id, itemId, quantity, card.scryfall_id)
+    )
+    // guard() has already surfaced the main process's written refusal.
+    if (!result) return
+    toast('success', t.p('decks.slotFilled', result.moved, { name: card.name }))
+    invalidate()
+  }
   const selectedCards = useMemo(
     () => allDeckCards.filter((card) => selected.has(card.id)),
     [allDeckCards, selected]
@@ -1002,6 +1045,20 @@ function DeckDetail({
         )}
       </AnimatePresence>
 
+      {fillCard && fillCard.scryfall_id && (
+        <FillSlotDialog
+          scryfallId={fillCard.scryfall_id}
+          cardName={fillCard.name}
+          slots={Math.max(1, fillCard.quantity - allocateCopies(fillCard).inDeck)}
+          onCancel={() => setFillId(null)}
+          onConfirm={(itemId, quantity) => {
+            const card = fillCard
+            setFillId(null)
+            void fillSlot(card, itemId, quantity)
+          }}
+        />
+      )}
+
       {listDialog && (
         <AddToListDialog
           // Always offered here: everything selectable on this screen is a deck
@@ -1049,7 +1106,8 @@ function DeckDetail({
             tileWidth={tileWidth}
             density={density}
             ready={ready || mode === 'rows'}
-            onZoom={(scryfallId, title, hasBack) => setZoom({ scryfallId, title, hasBack })}
+            onZoom={openZoom}
+            onFill={openFill}
           />
         )}
       </div>
@@ -1106,7 +1164,8 @@ function DeckBody({
   tileWidth,
   density,
   ready,
-  onZoom
+  onZoom,
+  onFill
 }: {
   items: DeckBodyItem[]
   deck: Deck
@@ -1120,6 +1179,8 @@ function DeckBody({
   ready: boolean
   /** Opens the closer look on the card whose thumbnail was clicked. */
   onZoom: (scryfallId: string, title: string, hasBack: boolean) => void
+  /** Offers to put one of your copies into the slot that was clicked. */
+  onFill: (id: number) => void
 }): React.ReactElement {
   const tileRowHeight = tileWidth * CARD_ASPECT + GRID_GAP
   // Declared before the `ready` bail-out below, because a hook cannot be conditional.
@@ -1176,6 +1237,7 @@ function DeckBody({
                 onPreview={preview.onEnter}
                 onPreviewEnd={preview.onLeave}
                 onZoom={onZoom}
+                onFill={onFill}
                 section={item.section}
               />
             ) : item.kind === 'tiles' ? (
@@ -1199,6 +1261,7 @@ function DeckBody({
                     density={density}
                     selected={selected.has(card.id)}
                     onSelect={onSelect}
+                    onFill={onFill}
                   />
                 ))}
               </div>
@@ -1275,6 +1338,26 @@ const SectionHeader = memo(function SectionHeader({
  * pieces of state, a ref and a portal for every card in the deck — which is now a
  * single control in the bulk bar, driven by the selection.
  */
+/**
+ * Whether this entry has a slot you could fill from your bulk right now.
+ *
+ * `owned_any`, not the allocated `fromCollection`. That figure comes from `in_collection`,
+ * which the breakdown derives as `exactOnly ? owned_exact : ...` — so with "require the
+ * exact printing" on, a copy in another printing counts nothing and the offer would vanish
+ * in precisely the case this exists for. That setting is about how the deck *counts*, not
+ * about which cards you may physically sleeve, and the repository agrees: the printing that
+ * goes in is yours.
+ *
+ * Knowingly optimistic: it does not subtract pick-list reservations or exclude proxied
+ * rows. The chooser shows what is free and disables the rest, and the main process refuses
+ * with a written reason — the rule this screen already follows for every other action.
+ * Asking per row would be one IPC per card in a virtualized list.
+ */
+function fillableSlots(card: DeckCardRow): number {
+  if (!card.oracle_id || !card.scryfall_id || card.owned_any <= 0) return 0
+  return Math.max(0, card.quantity - allocateCopies(card).inDeck)
+}
+
 const DeckCardLine = memo(function DeckCardLine({
   card,
   deck,
@@ -1284,6 +1367,7 @@ const DeckCardLine = memo(function DeckCardLine({
   onPreview,
   onPreviewEnd,
   onZoom,
+  onFill,
   section
 }: {
   card: DeckCardRow
@@ -1295,6 +1379,8 @@ const DeckCardLine = memo(function DeckCardLine({
   selected: boolean
   onSelect: (id: number, mode: PickMode) => void
   onZoom: (scryfallId: string, title: string, hasBack: boolean) => void
+  /** Offer to put one of your copies in this slot. Stable, like the others. */
+  onFill: (id: number) => void
   /** Show this card, big, beside the row. Stable, so this memoized row keeps its memo. */
   onPreview: (scryfallId: string | null, anchor: HTMLElement | null) => void
   onPreviewEnd: () => void
@@ -1304,6 +1390,7 @@ const DeckCardLine = memo(function DeckCardLine({
   // Derived through the same helper the totals use, so a row can never disagree with
    // the deck header about what is in the deck and what is merely yours.
   const allocated = allocateCopies(card)
+  const slots = fillableSlots(card)
   // Owning the card only in another printing is worth flagging: the physical
   // card you have is not the one the deck lists.
   const onlyOtherPrinting = card.owned_exact === 0 && card.owned_any > 0
@@ -1484,10 +1571,44 @@ const DeckCardLine = memo(function DeckCardLine({
         {allocated.inDeck >= card.quantity
           ? t('decks.have', { held: allocated.inDeck })
           : t('decks.haveOf', { held: allocated.inDeck, needed: card.quantity })}
-        {allocated.fromCollection > 0 && (
-          <span className="ml-1 text-ink-500" title={t('decks.inCollectionHint')}>
-            {t('decks.inBulk', { count: allocated.fromCollection })}
-          </span>
+        {/*
+          The suffix that already said "you have this in bulk" now offers to do something
+          about it. Reused rather than given its own cell: this row is a line of fixed-width
+          cells and was already wider than the smallest window, and every button before the
+          card name shifts an index the live selection probe reads.
+
+          The second label covers the case the suffix does not render — under the
+          exact-printing setting a copy in another printing allocates nothing, so
+          `fromCollection` is 0 while the card is sitting in your bulk all the same.
+        */}
+        {slots > 0 ? (
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              // A modified click is a selection gesture wherever it lands, exactly as the
+              // name button treats it — more so now this covers ground that was bare row.
+              if (e.ctrlKey || e.metaKey || e.shiftKey) {
+                onRowClick(e)
+                return
+              }
+              onPreviewEnd()
+              onFill(card.id)
+            }}
+            data-action="fillSlot"
+            title={t('decks.fillSlot', { count: card.owned_any })}
+            className="ml-1 rounded text-ink-500 underline decoration-dotted underline-offset-2
+              transition-colors hover:text-gold-300"
+          >
+            {allocated.fromCollection > 0
+              ? t('decks.inBulk', { count: allocated.fromCollection })
+              : t('decks.fillOther', { count: card.owned_any })}
+          </button>
+        ) : (
+          allocated.fromCollection > 0 && (
+            <span className="ml-1 text-ink-500" title={t('decks.inCollectionHint')}>
+              {t('decks.inBulk', { count: allocated.fromCollection })}
+            </span>
+          )
         )}
       </span>
 
@@ -1517,6 +1638,7 @@ const DeckCardLine = memo(function DeckCardLine({
       {/* Also narrowed for the price. Four badges, rarely more than one at a time. */}
       <span className="flex w-32 shrink-0 justify-end gap-1">
         {card.moved !== 0 && <PulledBadge card={card} />}
+        {card.filled > 0 && <FilledBadge card={card} />}
         {card.proxied && (
           <span
             title={t('proxy.deckSlot')}
@@ -1554,7 +1676,8 @@ const DeckGridTile = memo(function DeckGridTile({
   currency,
   density,
   selected,
-  onSelect
+  onSelect,
+  onFill
 }: {
   card: DeckCardRow
   deck: Deck
@@ -1563,10 +1686,13 @@ const DeckGridTile = memo(function DeckGridTile({
   density: ReturnType<typeof useGridMetrics>['density']
   selected: boolean
   onSelect: (id: number, mode: PickMode) => void
+  /** Offer to put one of your copies in this slot. Stable, so the memo holds. */
+  onFill: (id: number) => void
 }): React.ReactElement {
   const t = useT()
   const openCard = useApp((s) => s.openCard)
   const allocated = allocateCopies(card)
+  const slots = fillableSlots(card)
   // Complete means the deck holds it. Copies in your bulk are yours, not sleeved.
   const complete = allocated.inDeck >= card.quantity
   const coveredByBulk = !complete && allocated.missing === 0
@@ -1609,6 +1735,33 @@ const DeckGridTile = memo(function DeckGridTile({
         card.scryfall_id && openCard(card.scryfall_id, deckCardContext(card, deck))
       }
       onSelect={(selectMode) => onSelect(card.id, selectMode)}
+      /*
+        Outside the artwork button, which is why `CardTile` has a slot for it: `badges`
+        renders inside that button and anything clickable there is a button in a button.
+        Icon-only at every density — the tile drops its title and footer at `minimal` and a
+        word here would clip — with the sentence in the tooltip.
+      */
+      action={
+        slots > 0 ? (
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              // The corner never reaches CardTile's own handler, so a modified click
+              // ending here must not fire an action mid range-select.
+              if (e.ctrlKey || e.metaKey || e.shiftKey) return
+              onFill(card.id)
+            }}
+            data-action="fillSlot"
+            title={t('decks.fillSlot', { count: card.owned_any })}
+            aria-label={t('decks.fillTitle')}
+            className="grid h-5 w-5 place-items-center rounded border border-white/70
+              bg-black/50 text-white/80 opacity-0 transition-opacity group-hover:opacity-100
+              hover:bg-gold-500 hover:text-ink-950"
+          >
+            <PackagePlus size={12} />
+          </button>
+        ) : null
+      }
       badges={
         <>
           {card.moved !== 0 && (
@@ -1740,6 +1893,71 @@ const DeckGridTile = memo(function DeckGridTile({
  * Reverting is offered per pull rather than per card so a card pulled twice into
  * two different lists can be put back one at a time.
  */
+/**
+ * Says your own copies are filling this slot, and offers to take them back out.
+ *
+ * Its own badge rather than `PulledBadge`'s, because a fill is the opposite kind of fact.
+ * That badge means the deck no longer matches the decklist; this one means it does — the
+ * list asked for the card and you put one in. Nothing that counts cards reads `filled`, so
+ * this is the only place the difference is visible, and the only way to undo it.
+ */
+function FilledBadge({ card }: { card: DeckCardRow }): React.ReactElement {
+  const t = useT()
+  const toast = useApp((s) => s.toast)
+  const invalidate = useApp((s) => s.invalidate)
+  const [open, setOpen] = useState(false)
+  const trigger = useRef<HTMLButtonElement>(null)
+  const fills = card.moves.filter((move) => move.fills)
+
+  const revert = async (moveId: number): Promise<void> => {
+    setOpen(false)
+    const result = await guard(() => window.api.decks.revertMove(moveId))
+    if (result) {
+      toast('success', t.p('decks.moveReverted', result.quantity))
+      invalidate()
+    }
+  }
+
+  return (
+    <>
+      <button
+        ref={trigger}
+        onClick={(e) => {
+          e.stopPropagation()
+          setOpen((v) => !v)
+        }}
+        title={t.p('decks.filledHint', card.filled)}
+        className="rounded bg-good/20 px-1.5 py-0.5 text-[9px] font-semibold uppercase
+          text-good transition-colors hover:bg-good/30"
+      >
+        {t('decks.filledBadge')}
+      </button>
+
+      <Popover open={open} onClose={() => setOpen(false)} trigger={trigger} width={252}>
+        <p className="px-2 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wider text-ink-500">
+          {t('decks.filledTitle')}
+        </p>
+        {fills.map((move) => (
+          <button
+            key={move.id}
+            onClick={() => void revert(move.id)}
+            className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs
+              transition-colors hover:bg-ink-750"
+          >
+            <RotateCcw size={12} className="shrink-0 text-gold-300" />
+            <span className="min-w-0 flex-1 truncate text-ink-100">
+              {t.p('decks.filledHint', move.quantity)}
+            </span>
+            <span className="numeric shrink-0 text-[10px] text-ink-500">
+              {count(move.quantity)}
+            </span>
+          </button>
+        ))}
+      </Popover>
+    </>
+  )
+}
+
 function PulledBadge({ card }: { card: DeckCardRow }): React.ReactElement {
   const t = useT()
   const toast = useApp((s) => s.toast)

@@ -667,6 +667,24 @@ export const en = {
   'decks.haveOf': 'have {held} / {needed}',
   'decks.otherPrintingHint': 'You own {count} of this card, but in a different printing or language',
   'decks.otherPrinting': 'other printing',
+
+  // ---- Filling a listed slot from your bulk ----
+  'decks.fillSlot': 'Put one of your copies in the deck — you have {count} in bulk',
+  // Shown in place of the "in bulk" suffix when the exact-printing setting hides it: you
+  // hold the card, just not the printing the decklist names.
+  'decks.fillOther': '· {count} elsewhere',
+  'decks.fillTitle': 'Put a copy in the deck',
+  'decks.fillHint':
+    'The copy you pick leaves your bulk and goes into the deck. It can be a different printing or language — the deck records the card you actually put in, not the one Archidekt lists, and its card count does not change.',
+  'decks.fillHowMany': 'How many',
+  'decks.fillSlots': 'the deck still asks for {count}',
+  'decks.fillConfirm': 'Put in the deck',
+  'decks.slotFilled_one': '{count} copy of {name} is now in the deck.',
+  'decks.slotFilled_other': '{count} copies of {name} are now in the deck.',
+  'decks.filledBadge': 'filled',
+  'decks.filledHint_one': '{count} copy of yours fills this slot.',
+  'decks.filledHint_other': '{count} copies of yours fill this slot.',
+  'decks.filledTitle': 'Filled from your collection',
   'decks.labelOwnedHint': 'Marked "{label}" in Archidekt as a card you own, so these {count} count towards your collection.',
   'decks.labelOwnedShort': 'have it',
   'decks.labelLooseHint': 'Marked "{label}" in Archidekt, so this deck is not holding your copies — your {held} should be loose in your bulk.',
@@ -739,6 +757,7 @@ export const en = {
   // it was rather than just "undone".
   'undo.moveToCollection': 'Move to the collection',
   'undo.moveToDeck': 'Move to a deck',
+  'undo.fillSlot': 'Fill a deck slot',
   'undo.revertMove': 'Undo a move',
   'undo.addCard': 'Add cards',
   'undo.setQuantity': 'Change a quantity',
@@ -796,6 +815,12 @@ export const en = {
   'err.moveGone':
     'Cannot undo that move: {count} copies are where it would take {needed} from. They have been moved or removed since.',
   'err.deckNotFound': 'That deck no longer exists.',
+  'err.fillShortfall':
+    'This deck can only take {room} more, and {asked} were offered. Fill what it asks for, or move the rest in as extra copies from the collection screen.',
+  // Not a refusal about mislabelling, like the other proxy guards: the app has a better
+  // answer for this one, and it costs no card.
+  'err.fillProxy':
+    'A proxy cannot fill a listed slot. Mark the deck slot itself as a proxy instead — that says the same thing without spending a copy from your collection.',
   'err.pickNotOwned':
     'That deck entry is not marked as a card you own, so there is nothing to pull. Map its label colour to owned first.',
   'err.pickProxyMixes':

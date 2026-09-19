@@ -111,7 +111,8 @@ import {
   replaceDeckCards,
   setCardPrinting,
   setCardProxied,
-  upsertDeck
+  upsertDeck,
+  applyDeckMoves
 } from '../src/main/db/repos/decks.js'
 import {
   borrowedPricesFor,
@@ -3545,6 +3546,288 @@ async function main(): Promise<void> {
       // clean up, so later sections see the shape they expect
       db.run('DELETE FROM pick_lists WHERE name LIKE ?', ['verify-copies%'])
       db.run('DELETE FROM collection_items WHERE scryfall_id IN (?, ?)', [pair.a, pair.b])
+    }
+  }
+
+  // ------------------------------------------------- the label must not outrank the ledger
+  section('A copy you put in a deck outlives the next label recompute')
+  {
+    const db = getDb()
+
+    /*
+      The bug this pins down.
+
+      `recomputeLabelPossession` clears every row's flag and then re-derives it from the
+      Archidekt label colours. The clear pass exempts rows whose card you have moved copies
+      into -- the comment above it says why: such a row is held by the strongest evidence
+      there is, which is that you put the card there. The *colour* passes have no such
+      exemption, so the very next line stamps the row back to whatever its label says.
+
+      So: label a card "want", move one of your own copies into it, and the deck holds it
+      until the next sync -- at which point the card you physically sleeved silently stops
+      counting. Nothing about a fill is needed to reach this; it is live today.
+    */
+    const spare = db.get(
+      `SELECT p.scryfall_id, p.oracle_id, p.name
+         FROM printings p
+        WHERE p.oracle_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM collection_items ci WHERE ci.scryfall_id = p.scryfall_id)
+        ORDER BY p.scryfall_id LIMIT 1`
+    ) as { scryfall_id: string; oracle_id: string; name: string } | undefined
+
+    if (!spare) {
+      check('a printing outside the collection is cached', false, 'fixture too thin')
+    } else {
+      const deck = upsertDeck({
+        external_id: 'verify-label-vs-ledger',
+        name: 'Label versus ledger',
+        format: null,
+        owner_username: null,
+        url: null,
+        external_updated_at: null,
+        is_private: false,
+        is_unlisted: false
+      })
+      // Listed once, under a colour that means "I do not own this".
+      replaceDeckCards(deck, [
+        {
+          scryfall_id: spare.scryfall_id,
+          oracle_id: spare.oracle_id,
+          quantity: 1,
+          finish: 'nonfoil',
+          categories: [],
+          in_maindeck: true,
+          name: spare.name,
+          lang: 'en',
+          set_code: null,
+          collector_number: null,
+          rarity: null,
+          image_uri_small: null,
+          label: 'Need it,#E53935'
+        }
+      ])
+      const mapping = { '#e53935': 'not_owned' as const }
+      recomputeLabelPossession(mapping)
+
+      const entry = (): DeckCardRow | undefined =>
+        allDeckCards(deckBreakdown(deck, 'usd', false)).find((c) => c.oracle_id === spare.oracle_id)
+      check('a card under a "do not own" label starts unheld',
+        entry()?.in_deck === 0, `in_deck ${entry()?.in_deck}`)
+
+      // One copy of the very printing the decklist names, moved in from the collection.
+      addToCollection({
+        scryfall_id: spare.scryfall_id,
+        finish: 'nonfoil',
+        condition: 'NM',
+        quantity: 1
+      })
+      const item = (
+        db.get(
+          `SELECT id FROM collection_items
+            WHERE scryfall_id = ? AND finish = 'nonfoil' AND condition = 'NM'`,
+          [spare.scryfall_id]
+        ) as { id: number }
+      ).id
+      moveToDeck(deck, item, 1)
+      check('moving a copy in makes the deck hold it',
+        (entry()?.in_deck ?? 0) > 0, `in_deck ${entry()?.in_deck}`)
+
+      /*
+        And the recompute a sync performs must not take it away again. The colour still
+        says "I do not own this" -- and it is still right about the copies Archidekt knows
+        about. It is not right about the one in your hand.
+      */
+      recomputeLabelPossession(mapping)
+      check('and the next label recompute does not take it away',
+        (entry()?.in_deck ?? 0) > 0,
+        `in_deck ${entry()?.in_deck}, possession ${entry()?.label_possession}`)
+
+      // clean up, so later sections see the shape they expect
+      db.run('DELETE FROM decks WHERE external_id = ?', ['verify-label-vs-ledger'])
+      db.run('DELETE FROM collection_items WHERE scryfall_id = ?', [spare.scryfall_id])
+      recomputeLabelPossession({})
+    }
+  }
+
+  // ------------------------------------------------- filling a slot the list already counts
+  section('Filling a listed slot with a copy you own')
+  {
+    const db = getDb()
+
+    /*
+      The distinction this whole feature turns on.
+
+      Moving a card into a deck gives it a copy the decklist never asked for, so the deck
+      grows by one. Filling means the copies the list was already counting have arrived:
+      the listed row is repointed onto the printing you actually put there, and the total
+      does not move. Everything below is that sentence, asserted.
+    */
+    const pair = db.get(
+      `SELECT a.scryfall_id AS a, b.scryfall_id AS b, a.oracle_id AS oracle, a.name AS name
+         FROM printings a
+         JOIN printings b ON b.oracle_id = a.oracle_id AND b.scryfall_id > a.scryfall_id
+        WHERE a.oracle_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM collection_items ci
+            JOIN printings pp ON pp.scryfall_id = ci.scryfall_id
+            WHERE pp.oracle_id = a.oracle_id
+          )
+        ORDER BY a.scryfall_id LIMIT 1`
+    ) as { a: string; b: string; oracle: string; name: string } | undefined
+
+    if (!pair) {
+      check('two printings of one card are cached', false, 'fixture too thin')
+    } else {
+      const deck = upsertDeck({
+        external_id: 'verify-fill',
+        name: 'Fill a slot',
+        format: null,
+        owner_username: null,
+        url: null,
+        external_updated_at: null,
+        is_private: false,
+        is_unlisted: false
+      })
+      /** The decklist: N copies of printing A, under a colour meaning "I do not own it". */
+      const listed = (quantity: number): void => {
+        replaceDeckCards(deck, [
+          {
+            scryfall_id: pair.a,
+            oracle_id: pair.oracle,
+            quantity,
+            finish: 'nonfoil',
+            categories: ['Creature'],
+            in_maindeck: true,
+            name: pair.name,
+            lang: 'en',
+            set_code: null,
+            collector_number: null,
+            rarity: null,
+            image_uri_small: null,
+            label: 'Need it,#E53935'
+          }
+        ])
+        recomputeLabelPossession({ '#e53935': 'not_owned' })
+      }
+      const reset = (quantity: number, own: number): void => {
+        db.run('DELETE FROM deck_card_moves WHERE deck_id = ?', [deck])
+        db.run('DELETE FROM deck_card_overrides WHERE deck_id = ?', [deck])
+        db.run('DELETE FROM deck_entry_traits WHERE deck_id = ?', [deck])
+        db.run('DELETE FROM collection_items WHERE scryfall_id IN (?, ?)', [pair.a, pair.b])
+        listed(quantity)
+        // Owned in the *other* printing, which is the case the feature exists for.
+        if (own > 0) {
+          addToCollection({
+            scryfall_id: pair.b,
+            finish: 'nonfoil',
+            condition: 'NM',
+            quantity: own
+          })
+        }
+      }
+      const mine = (): number =>
+        (
+          db.get(
+            `SELECT id FROM collection_items
+              WHERE scryfall_id = ? AND finish = 'nonfoil' AND condition = 'NM'`,
+            [pair.b]
+          ) as { id: number }
+        ).id
+      const rows = (): DeckCardRow[] =>
+        allDeckCards(deckBreakdown(deck, 'usd', false)).filter((c) => c.oracle_id === pair.oracle)
+      const totals = (): ReturnType<typeof deckBreakdown> => deckBreakdown(deck, 'usd', false)
+      const refusal = (fn: () => void): string => {
+        try {
+          fn()
+          return ''
+        } catch (err) {
+          return (err as Error).message
+        }
+      }
+
+      // ---- a whole slot, filled with the other printing
+      reset(1, 1)
+      const before = totals()!.totals.cards
+      moveToDeck(deck, mine(), 1, pair.a)
+      const filled = rows()
+      check('filling a slot leaves one row, not two',
+        filled.length === 1, JSON.stringify(filled.map((r) => r.scryfall_id?.slice(0, 8))))
+      check('and it is on the printing you actually put in',
+        filled[0]?.scryfall_id === pair.b, filled[0]?.scryfall_id?.slice(0, 8))
+      check('the deck holds it now',
+        filled[0]?.in_deck === 1, `in_deck ${filled[0]?.in_deck}`)
+      /*
+        The invariant the whole design is built to keep. Adding would have made this 2.
+      */
+      check('and the deck is the same size as before',
+        totals()!.totals.cards === before, `${totals()!.totals.cards} vs ${before}`)
+      check('the slot keeps the category the decklist gave it',
+        filled[0]?.section === 'Creature', filled[0]?.section)
+      check('a fill is not a divergence, so it carries no moved tag',
+        filled[0]?.moved === 0 && filled[0]?.filled === 1,
+        JSON.stringify({ moved: filled[0]?.moved, filled: filled[0]?.filled }))
+      check('and the copies left your collection',
+        (db.get('SELECT COUNT(*) AS n FROM collection_items WHERE scryfall_id = ?', [
+          pair.b
+        ]) as { n: number }).n === 0)
+
+      // ---- and it survives the next sync, exactly once
+      listed(1)
+      const synced = rows()
+      check('a fill survives a re-sync, exactly once',
+        synced.length === 1 && synced[0]?.scryfall_id === pair.b && synced[0]?.in_deck === 1,
+        JSON.stringify(synced.map((r) => ({ id: r.scryfall_id?.slice(0, 8), q: r.quantity, held: r.in_deck }))))
+      check('and the deck is still the size the decklist says',
+        totals()!.totals.cards === before, `${totals()!.totals.cards} vs ${before}`)
+
+      // ---- a partial fill splits the entry, and the parts add up
+      reset(4, 2)
+      moveToDeck(deck, mine(), 2, pair.a)
+      const split = rows()
+      check('a partial fill splits the entry in two',
+        split.length === 2, `${split.length} rows`)
+      check('and the parts add up to what the decklist asks for',
+        split.reduce((sum, r) => sum + r.quantity, 0) === 4,
+        JSON.stringify(split.map((r) => r.quantity)))
+      check('the filled part is held, the remainder is not',
+        split.filter((r) => r.in_deck > 0).length === 1 &&
+          split.find((r) => r.scryfall_id === pair.b)?.in_deck === 2,
+        JSON.stringify(split.map((r) => ({ id: r.scryfall_id?.slice(0, 8), held: r.in_deck }))))
+
+      // ---- reverting puts the slot back and the copies with it
+      const fillMove = (db.get(
+        'SELECT id FROM deck_card_moves WHERE deck_id = ? AND fills = 1 ORDER BY id DESC LIMIT 1',
+        [deck]
+      ) as { id: number } | undefined)
+      if (fillMove) revertMove(fillMove.id)
+      const reverted = rows()
+      check('reverting a fill merges the slot back into one row',
+        reverted.length === 1 && reverted[0]?.scryfall_id === pair.a,
+        JSON.stringify(reverted.map((r) => ({ id: r.scryfall_id?.slice(0, 8), q: r.quantity }))))
+      check('with the quantity the decklist asked for',
+        reverted[0]?.quantity === 4, `${reverted[0]?.quantity}`)
+      check('and the copies back in your collection',
+        (db.get('SELECT quantity FROM collection_items WHERE scryfall_id = ?', [pair.b]) as {
+          quantity: number
+        } | undefined)?.quantity === 2)
+
+      // ---- the refusals
+      reset(1, 2)
+      const tooMany = refusal(() => moveToDeck(deck, mine(), 2, pair.a))
+      check('filling more than the slot asks for is refused',
+        tooMany === tp('en', 'err.fillShortfall', 1, { room: 1, asked: 2 }) || tooMany.length > 0,
+        tooMany || 'it was allowed')
+
+      reset(1, 1)
+      bulkUpdate([mine()], { proxied: 1 })
+      const proxy = refusal(() => moveToDeck(deck, mine(), 1, pair.a))
+      check('and a proxy is pointed at the deck slot flag instead',
+        proxy === t('en', 'err.fillProxy'), proxy || 'it was allowed')
+
+      // clean up, so later sections see the shape they expect
+      db.run('DELETE FROM decks WHERE external_id = ?', ['verify-fill'])
+      db.run('DELETE FROM collection_items WHERE scryfall_id IN (?, ?)', [pair.a, pair.b])
+      recomputeLabelPossession({})
     }
   }
 

@@ -651,8 +651,19 @@ export function registerHandlers(): void {
         moveToCollection(deckId, oracleId, quantity, scryfallId)
       )
   )
-  handle('decks:moveToDeck', (deckId: number, itemId: number, quantity: number) =>
-    undoable('undo.moveToDeck', moveScopes(deckId), () => moveToDeck(deckId, itemId, quantity))
+  handle(
+    'decks:moveToDeck',
+    (deckId: number, itemId: number, quantity: number, fillEntryScryfallId?: string | null) =>
+      /*
+        Two actions behind one channel, and the label says which: filling a slot the
+        decklist already counted reads differently in the undo tooltip from adding a card
+        the deck never asked for.
+      */
+      undoable(
+        fillEntryScryfallId ? 'undo.fillSlot' : 'undo.moveToDeck',
+        moveScopes(deckId),
+        () => moveToDeck(deckId, itemId, quantity, fillEntryScryfallId)
+      )
   )
   handle('decks:revertMove', (moveId: number) =>
     undoable('undo.revertMove', moveScopes(null), () => revertMove(moveId))

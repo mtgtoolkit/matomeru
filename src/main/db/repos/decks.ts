@@ -263,21 +263,53 @@ export function replaceDeckCards(deckId: number, cards: DeckCardUpsert[]): void 
  * was made, and take that much off the marker.
  */
 export function applyDeckMoves(db: Sql, deckId: number): void {
+  /*
+    `entry_scryfall_id` is selected, and that is not incidental.
+
+    It says which entry the copies came out of when that is not their own printing --
+    which, on any deck with a printing override, is *every* move out: `moveToCollection`
+    records the resolved printing as the copies' and the raw one as the entry's. Leaving
+    it out of this SELECT spread it into `applyOneMove` as undefined, so the replay fell
+    back to preferring the copies' printing and took the copies out of whichever row came
+    first instead. Exactly the mistake the ORDER BY in `applyOneMove` exists to prevent,
+    reintroduced once per sync.
+  */
   const moves = db.all(
-    `SELECT id, oracle_id, scryfall_id, finish, condition, quantity, deck_quantity_at_move
+    `SELECT id, oracle_id, scryfall_id, entry_scryfall_id, entry_finish, finish, condition,
+            quantity, deck_quantity_at_move, fills
      FROM deck_card_moves WHERE deck_id = ? ORDER BY id`,
     [deckId]
   ) as {
     id: number
     oracle_id: string
     scryfall_id: string
+    entry_scryfall_id: string | null
+    entry_finish: string | null
     finish: string
     condition: string
     quantity: number
     deck_quantity_at_move: number
+    fills: number
   }[]
 
   for (const move of moves) {
+    /*
+      A fill sits outside the reconciliation rule below, and this is required rather than
+      an optimisation.
+
+      That rule retires a marker once Archidekt has "travelled" as far as the move did --
+      measured on the deck's size. A fill never changes the deck's size, so it can never be
+      travelled toward, and the arithmetic would compare its quantity against a number that
+      moves for unrelated reasons: bump the decklist from 1x to 2x and `travelled` reaches
+      the marker's size, the marker is deleted, and the physical card -- which left
+      `collection_items` when it was filled and is recorded nowhere else -- evaporates.
+
+      A fill marker is retired by a revert, and by nothing else.
+    */
+    if (move.fills === 1) {
+      applyFill(db, deckId, move)
+      continue
+    }
     const listed = (
       db.get(
         'SELECT COALESCE(SUM(quantity), 0) AS quantity FROM deck_cards WHERE deck_id = ? AND oracle_id = ?',
@@ -387,8 +419,13 @@ export function applyOneMove(
 
     `label_possession` is set explicitly and this is load-bearing: it is a card you
     physically put there, so it has to count as held, and a row created here has no
-    Archidekt label for `recomputeLabelPossession` to derive one from. That is also
-    why this runs *after* the recompute — the recompute clears every row's flag.
+    Archidekt label for `recomputeLabelPossession` to derive one from.
+
+    The recompute runs *after* this, not before -- `applyDeckMoves` is called from inside
+    `replaceDeckCards`, and the recompute follows once every deck is synced. So what
+    protects this flag is that both of the recompute's passes exempt rows the ledger says
+    you moved copies into. The clear pass always did; the colour pass did not, and the
+    flag was quietly reverted on every sync until it did.
   */
   const existing = db.get(
     'SELECT id, quantity FROM deck_cards WHERE deck_id = ? AND scryfall_id = ? ORDER BY id LIMIT 1',
@@ -624,8 +661,21 @@ export function deckBreakdown(
             */
             COALESCE((SELECT SUM(m.quantity) FROM deck_card_moves m
                       WHERE m.deck_id = dc.deck_id AND m.oracle_id = dc.oracle_id
+                        AND m.fills = 0
                         AND COALESCE(m.entry_scryfall_id, m.scryfall_id) = dc.scryfall_id),
-                     0) AS moved
+                     0) AS moved,
+            /*
+              Copies of yours filling this slot. Excluded from the sum above, because
+              that one means the deck no longer matches the decklist and a fill means the
+              opposite: the list asked for these cards and they have arrived.
+
+              Matched on the copies' printing rather than the entry's, because after a fill
+              the row *is* the copies' printing -- that is what filling did.
+            */
+            COALESCE((SELECT SUM(m.quantity) FROM deck_card_moves m
+                      WHERE m.deck_id = dc.deck_id AND m.oracle_id = dc.oracle_id
+                        AND m.fills = 1 AND m.scryfall_id = dc.scryfall_id),
+                     0) AS filled
      FROM deck_cards dc
      LEFT JOIN deck_card_overrides o
             ON o.deck_id = dc.deck_id AND o.oracle_id = dc.oracle_id
@@ -958,6 +1008,28 @@ export interface PossessionCounts {
  * changing a colour's state takes effect immediately with no network access and
  * no deck re-sync.
  */
+/**
+ * The state one row's label implies, by the same rules the recompute applies to all of them.
+ *
+ * A revert needs this: putting a filled slot back means giving it the possession its label
+ * says, and leaving it NULL instead is a different answer -- "no colour mapped" rather than
+ * "mapped to not owned" -- which reads as a blank badge until the next sync happens to
+ * correct it. The no-label case is `'owned'` here for the same reason the recompute's last
+ * pass says so.
+ */
+export function possessionOfLabel(
+  label: string | null,
+  /** The colour map, passed in rather than read here so this stays a pure function. */
+  possession: Record<string, Possession>
+): Possession | null {
+  if (!label || !label.trim()) return 'owned'
+  for (const [color, state] of Object.entries(possession)) {
+    const normalized = color.trim().toLowerCase()
+    if (normalized && label.toLowerCase().endsWith(normalized)) return state
+  }
+  return null
+}
+
 export function recomputeLabelPossession(
   possession: Record<string, Possession>
 ): PossessionCounts {
@@ -1001,9 +1073,28 @@ export function recomputeLabelPossession(
     // a label is "name,#color", so a colour match means the string ends with it.
     // LIKE is case-insensitive for ASCII in SQLite, which is what we want for hex.
     const clauses = colors.map(() => 'label LIKE ?').join(' OR ')
+    /*
+      Same exemption as the clear pass, and for the same reason -- it was missing here,
+      which made the clear pass's care pointless. A row you moved copies into was cleared
+      correctly and then stamped straight back to whatever its Archidekt colour says, so a
+      card you physically sleeved stopped counting as held on the very next sync. The
+      colour is still right about the copies Archidekt knows about; it is not right about
+      the one in your hand.
+
+      Narrower than the clear pass on purpose: per printing, not per card. The copies you
+      moved in landed on the row for *their* printing, and another entry of the same card
+      is still described by the label Archidekt put on it.
+    */
     db.run(
       `UPDATE deck_cards SET label_possession = ?
-       WHERE label IS NOT NULL AND label != '' AND (${clauses})`,
+       WHERE label IS NOT NULL AND label != '' AND (${clauses})
+         AND NOT EXISTS (
+           SELECT 1 FROM deck_card_moves m
+           WHERE m.deck_id = deck_cards.deck_id
+             AND m.oracle_id = deck_cards.oracle_id
+             AND m.quantity > 0
+             AND m.scryfall_id = deck_cards.scryfall_id
+         )`,
       [state, ...colors.map((color) => `%${color}`)]
     )
   }
@@ -1413,6 +1504,13 @@ export function recordMove(
      * was overridden.
      */
     entryScryfallId?: string | null
+    /** The finish that entry carried, so a revert can put the slot back as it was. */
+    entryFinish?: string | null
+    /**
+     * Whether this fills a slot the decklist already counted rather than adding to the
+     * deck. A fill changes no total; see migration 22.
+     */
+    fills?: boolean
   }
 ): void {
   const listed = (
@@ -1425,8 +1523,8 @@ export function recordMove(
   db.run(
     `INSERT INTO deck_card_moves
        (deck_id, oracle_id, scryfall_id, finish, condition, quantity,
-        deck_quantity_at_move, foil_treatment, entry_scryfall_id, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        deck_quantity_at_move, foil_treatment, entry_scryfall_id, entry_finish, fills, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       input.deckId,
       input.oracleId,
@@ -1437,9 +1535,121 @@ export function recordMove(
       listed,
       input.foilTreatment ?? null,
       input.entryScryfallId ?? null,
+      input.entryFinish ?? null,
+      input.fills ? 1 : 0,
       nowIso()
     ]
   )
+}
+
+/** One unheld slot of a card, as `applyFill` walks them. */
+interface FillSlot {
+  id: number
+  quantity: number
+  label_possession: string | null
+}
+
+/**
+ * Fills slots the decklist already counted with copies you actually hold.
+ *
+ * The counterpart to `applyOneMove`, and deliberately not part of it: that function adds
+ * copies to a deck, and adding is the one thing a fill must never do. The decklist already
+ * asks for these cards. What changes is that the deck now holds them, and which printing
+ * it holds them in.
+ *
+ * So the listed row is *repointed*, not topped up. A whole slot becomes the copies in
+ * place -- same row, same id, same categories, same label -- and a partial one keeps the
+ * filled part on the row you clicked and splits the remainder off beside it, carrying the
+ * label and possession the entry had. `SUM(dc.quantity)` for the card is identical before
+ * and after, which is what makes the deck's totals correct with no change to anything that
+ * counts them.
+ *
+ * Rows already held are skipped: their copies are there. So are proxied ones, which fill
+ * their slot by standing in for the card. Both are the same question `in_deck` asks.
+ */
+export function applyFill(
+  db: Sql,
+  deckId: number,
+  move: {
+    oracle_id: string
+    /** The printing of the copies going in. */
+    scryfall_id: string
+    finish: string
+    quantity: number
+    /** The entry's own printing, and the finish to put back on a revert. */
+    entry_scryfall_id?: string | null
+    entry_finish?: string | null
+  }
+): void {
+  const preferred = move.entry_scryfall_id ?? move.scryfall_id
+  /*
+    The entry asked for first, then any other slot of the card that is still unheld --
+    the same preference-not-filter rule, for the same reason, as the take-out branch of
+    `applyOneMove`: Archidekt may have re-pointed the entry since the screen drew it, and
+    the copies still have to go somewhere.
+  */
+  const slots = db.all(
+    `SELECT dc.id, dc.quantity, dc.label_possession
+       FROM deck_cards dc
+       ${DECK_TRAITS_JOIN}
+      WHERE dc.deck_id = ? AND dc.oracle_id = ? AND dc.quantity > 0
+        AND dc.label_possession IS NOT 'owned'
+        AND ${DECK_PROXIED} = 0
+      ORDER BY COALESCE(dc.scryfall_id = ?, 0) DESC, dc.id`,
+    [deckId, move.oracle_id, preferred]
+  ) as FillSlot[]
+
+  let owed = move.quantity
+  for (const slot of slots) {
+    if (owed <= 0) break
+    const take = Math.min(owed, slot.quantity)
+    owed -= take
+    if (take === slot.quantity) {
+      // The whole slot: the row *becomes* the copies. Nothing created, nothing emptied.
+      db.run(
+        `UPDATE deck_cards
+            SET scryfall_id = ?, finish = ?, label_possession = 'owned'
+          WHERE id = ?`,
+        [move.scryfall_id, move.finish, slot.id]
+      )
+      continue
+    }
+    /*
+      Part of it. The row you clicked keeps its id and becomes the filled part; the
+      remainder is the new row and carries the label, which is what keeps it reading as
+      not-owned and what a later recompute will keep deriving its state from.
+    */
+    db.run(
+      `UPDATE deck_cards
+          SET scryfall_id = ?, finish = ?, quantity = ?, label_possession = 'owned'
+        WHERE id = ?`,
+      [move.scryfall_id, move.finish, take, slot.id]
+    )
+    db.run(
+      `INSERT INTO deck_cards (
+         deck_id, scryfall_id, oracle_id, quantity, finish, categories, in_maindeck,
+         name, lang, set_code, collector_number, rarity, image_uri_small, label,
+         label_possession
+       )
+       SELECT deck_id, ?, oracle_id, ?, ?, categories, in_maindeck, name, lang, set_code,
+              collector_number, rarity, image_uri_small, label, ?
+         FROM deck_cards WHERE id = ?`,
+      [
+        move.entry_scryfall_id ?? move.scryfall_id,
+        slot.quantity - take,
+        move.entry_finish ?? move.finish,
+        slot.label_possession,
+        slot.id
+      ]
+    )
+  }
+
+  /*
+    More copies than the decklist has room for, which only a replay can reach: Archidekt
+    shrank the list after the fill was made. They are no longer filling anything, so they
+    become what they now are -- copies the deck holds that the list does not mention.
+  */
+  if (owed > 0) applyOneMove(db, deckId, { ...move, quantity: owed })
 }
 
 /**
@@ -1451,14 +1661,17 @@ export function recordMove(
  */
 export function deckMoves(deckId: number): Map<string, DeckMove[]> {
   const rows = getDb().all(
-    `SELECT id, deck_id, oracle_id, scryfall_id, finish, condition, quantity, created_at
+    `SELECT id, deck_id, oracle_id, scryfall_id, finish, condition, quantity, fills, created_at
      FROM deck_card_moves WHERE deck_id = ?
      ORDER BY created_at DESC, id DESC`,
     [deckId]
-  ) as DeckMove[]
+  ) as (Omit<DeckMove, 'fills'> & { fills: number })[]
 
+  // SQLite has no boolean, so the flag arrives as 0 or 1. Mapped here rather than cast,
+  // because `DeckMove.fills` is declared a boolean and every reader tests it as one.
   const byOracle = new Map<string, DeckMove[]>()
-  for (const row of rows) {
+  for (const raw of rows) {
+    const row: DeckMove = { ...raw, fills: raw.fills === 1 }
     const list = byOracle.get(row.oracle_id)
     if (list) list.push(row)
     else byOracle.set(row.oracle_id, [row])

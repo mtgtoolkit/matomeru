@@ -35,6 +35,18 @@ export interface CardTileProps {
   /** Plain click: open the card. Ctrl/Shift are handled before this fires. */
   onOpen?: () => void
   onSelect?: (mode: 'toggle' | 'range') => void
+  /**
+   * A control drawn in the bottom-left corner, outside the artwork button.
+   *
+   * Anything interactive on a tile belongs here. `badges` and `footer` both render
+   * *inside* that button, so a button among them is a button inside a button — invalid
+   * markup that never receives its click. The selection checkbox has always been an
+   * outside sibling for exactly this reason; this is the same slot for everything else.
+   *
+   * Build it inside a memoized per-card component, for the same reason `badges` and
+   * `footer` say so.
+   */
+  action?: React.ReactNode
 }
 
 /**
@@ -63,7 +75,8 @@ function CardTileImpl({
   selectable = true,
   disabledReason,
   onOpen,
-  onSelect
+  onSelect,
+  action
 }: CardTileProps): React.ReactElement {
   const t = useT()
   const showText = density !== 'minimal'
@@ -137,6 +150,13 @@ function CardTileImpl({
           <Check size={12} strokeWidth={3} />
         </button>
       )}
+
+      {/*
+        Also outside the button, and below the checkbox rather than beside it: the footer
+        gradient is painted inside that earlier sibling, so a later positioned element sits
+        over it. `z-10` because the button carries a ring of its own.
+      */}
+      {action && <div className="absolute bottom-1.5 left-1.5 z-10">{action}</div>}
     </div>
   )
 }

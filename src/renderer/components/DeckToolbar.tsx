@@ -124,9 +124,20 @@ export default function DeckToolbar({
           className="w-40"
           value={filters.ownership}
           onChange={(ownership) => onChange({ ownership: ownership as DeckOwnership })}
+          /*
+            All four, in the order the deck allocates them: in the deck, then yours but
+            not in it, then neither.
+
+            `inCollection` was implemented in `matchesDeckFilters` and translated, and
+            only this array left it out -- so the one query worth having, "what could I
+            put in this deck right now", could not be asked. The three ownership states
+            partition the deck, and the dropdown offering two of them made the middle
+            one invisible rather than absent.
+          */
           options={[
             { value: 'all', label: OWNERSHIP_LABEL.all },
             { value: 'owned', label: OWNERSHIP_LABEL.owned },
+            { value: 'inCollection', label: OWNERSHIP_LABEL.inCollection },
             { value: 'missing', label: OWNERSHIP_LABEL.missing }
           ]}
         />

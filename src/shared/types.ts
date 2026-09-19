@@ -517,6 +517,8 @@ export interface PickList {
  * nothing needs to ask where a card could be pulled from now that moving is direct.
  */
 export interface DeckMove {
+  /** Whether this filled a slot the decklist already counted, rather than adding to it. */
+  fills: boolean
   id: number
   deck_id: number
   oracle_id: string
@@ -715,6 +717,14 @@ export interface DeckCardRow {
    * written into the deck rows instead of adjusted while reading them.
    */
   moved: number
+  /**
+   * Copies of this entry that your own cards are filling, or 0.
+   *
+   * Kept apart from `moved` because a fill is not a divergence from the decklist — the
+   * list asked for these cards and they are here. Nothing that counts cards reads this;
+   * it exists so the row can say the slot is filled and offer to undo it.
+   */
+  filled: number
   /** The moves behind `moved`, newest first, so each can be reverted on its own. */
   moves: DeckMove[]
   /** True when this card sits in the deck's premier category (its commander). */
