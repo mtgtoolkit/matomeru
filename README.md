@@ -15,7 +15,7 @@ and a backup, if you ask for one.
 
 ## Getting it
 
-Download from the [latest release](https://github.com/Sfoucheur/matomeru/releases):
+Download from the [latest release](https://github.com/mtgtoolkit/matomeru/releases):
 
 - **`Matomeru-Setup-x.y.z.exe`** — the installer. Choose this one: it can update itself.
 - **`Matomeru x.y.z.exe`** — portable, if you would rather not install anything. It runs
@@ -95,7 +95,7 @@ A few things worth knowing:
   [your Google account](https://myaccount.google.com/permissions).
 
 Full detail of what is stored and what is sent where: the [privacy
-policy](https://sfoucheur.github.io/matomeru/privacy.html).
+policy](https://mtgtoolkit.github.io/matomeru/privacy.html).
 
 ## Updates
 

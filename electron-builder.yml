@@ -15,7 +15,7 @@ asarUnpack:
 # first use rather than reporting that it cannot check.
 publish:
   provider: github
-  owner: Sfoucheur
+  owner: mtgtoolkit
   repo: matomeru
   # Stated rather than left to the default, because it is load-bearing twice over: the
   # draft is the manual validation step at the end of the release pipeline, and

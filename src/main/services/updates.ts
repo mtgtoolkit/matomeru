@@ -31,7 +31,7 @@ function tr(key: TranslationKey, vars?: Record<string, string | number>): string
   return t(getLocale(), key, vars)
 }
 
-const OWNER = 'Sfoucheur'
+const OWNER = 'mtgtoolkit'
 const REPO = 'matomeru'
 const RELEASES_PAGE = `https://github.com/${OWNER}/${REPO}/releases`
 
